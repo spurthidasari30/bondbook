@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: bondbook-api
+    runtime: docker
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: ./backend
+    disk:
+      name: bondbook-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: SECRET_KEY
+        generateValue: true
+      - key: DATABASE_URL
+        value: sqlite:////var/data/bondbook.db
+      - key: UPLOAD_DIR
+        value: /var/data/uploads
+      - key: CORS_ORIGINS
+        sync: false
