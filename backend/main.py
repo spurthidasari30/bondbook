@@ -27,6 +27,12 @@ DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./bondbook.db")
 if DATABASE_URL.startswith("sqlite:///") and not DATABASE_URL.startswith("sqlite:////"):
     database_file = DATABASE_URL.replace("sqlite:///", "", 1)
     DATABASE_URL = f"sqlite:///{(BASE_DIR / database_file).resolve()}"
+# Render supplies a standard Postgres URL. SQLAlchemy needs the explicit
+# psycopg v3 dialect installed by requirements.txt.
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+psycopg://", 1)
+elif DATABASE_URL.startswith("postgresql://"):
+    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
 SECRET_KEY = os.getenv("SECRET_KEY", "development-only-change-me-before-deployment")
 ALGORITHM = "HS256"
 TOKEN_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "10080"))
@@ -34,13 +40,17 @@ MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_MB", "25")) * 1024 * 1024
 UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", str(BASE_DIR / "uploads")))
 UPLOAD_DIR.mkdir(exist_ok=True)
 
-engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+engine_options = {"pool_pre_ping": True}
+if DATABASE_URL.startswith("sqlite"):
+    engine_options["connect_args"] = {"check_same_thread": False}
+engine = create_engine(DATABASE_URL, **engine_options)
 
-@event.listens_for(engine, "connect")
-def sqlite_foreign_keys(dbapi_connection, connection_record):
-    cursor = dbapi_connection.cursor()
-    cursor.execute("PRAGMA foreign_keys=ON")
-    cursor.close()
+if engine.dialect.name == "sqlite":
+    @event.listens_for(engine, "connect")
+    def sqlite_foreign_keys(dbapi_connection, connection_record):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
 
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
@@ -327,10 +337,9 @@ def dashboard(user: User = Depends(current_user), db: Session = Depends(db_sessi
     visible = visible_memories_for(user)
     total = db.scalar(select(func.count()).select_from(Memory).where(Memory.owner_id == user.id, Memory.is_reflection == False)) or 0
     shared = db.scalar(select(func.count()).select_from(Memory).where(Memory.owner_id == user.id, Memory.visibility == "Shared")) or 0
-    media_count = db.scalar(select(func.count()).select_from(Media).join(Memory).where(Memory.owner_id == user.id)) or 0
     reflections = db.scalar(select(func.count()).select_from(Memory).where(visible, Memory.is_reflection == True)) or 0
     recent = db.scalars(select(Memory).where(visible).order_by(Memory.created_at.desc()).limit(6)).all()
-    return {"stats": {"memories": total, "shared": shared, "media": media_count, "reflections": reflections}, "recent": [memory_data(m, db) for m in recent]}
+    return {"stats": {"memories": total, "shared": shared, "reflections": reflections}, "recent": [memory_data(m, db) for m in recent]}
 
 @app.get("/api/memories")
 def list_memories(q: str = "", category: str = "", visibility: str = "", tag: str = "", media_type: str = "", date_from: Optional[date] = None, date_to: Optional[date] = None, mine_only: bool = False, reflections_only: bool = False, user: User = Depends(current_user), db: Session = Depends(db_session)):
@@ -420,6 +429,7 @@ ALLOWED_TYPES = {"image/jpeg": "image", "image/png": "image", "image/webp": "ima
 
 @app.post("/api/memories/{memory_id}/media", status_code=201)
 async def upload_media(memory_id: int, file: UploadFile = File(...), user: User = Depends(current_user), db: Session = Depends(db_session)):
+    friendly_error("Media uploads are disabled in this text-only BondBook deployment.", 410)
     memory = db.get(Memory, memory_id)
     if not memory: friendly_error("Memory not found.", 404)
     if memory.owner_id != user.id: friendly_error("Only the owner can add media.", 403)
@@ -478,6 +488,7 @@ def timeline(user: User = Depends(current_user), db: Session = Depends(db_sessio
 
 @app.get("/api/gallery")
 def gallery(kind: str = "", user: User = Depends(current_user), db: Session = Depends(db_session)):
+    return []
     visible = visible_memories_for(user)
     query = select(Media).join(Memory).where(visible)
     if kind: query = query.where(Media.kind == kind)

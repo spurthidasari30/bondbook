@@ -1,19 +1,37 @@
 services:
   - type: web
+    name: bondbook-web
+    runtime: static
+    buildCommand: npm ci && npm run build
+    staticPublishPath: ./frontend/dist
+    rootDir: frontend
+    envVars:
+      - key: VITE_API_URL
+        fromService:
+          name: bondbook-api
+          type: web
+          envVarKey: RENDER_EXTERNAL_URL
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
+
+  - type: web
     name: bondbook-api
     runtime: docker
+    plan: free
     dockerfilePath: ./backend/Dockerfile
     dockerContext: ./backend
-    disk:
-      name: bondbook-data
-      mountPath: /var/data
-      sizeGB: 1
     envVars:
       - key: SECRET_KEY
         generateValue: true
       - key: DATABASE_URL
-        value: sqlite:////var/data/bondbook.db
-      - key: UPLOAD_DIR
-        value: /var/data/uploads
+        fromDatabase:
+          name: bondbook-db
+          property: connectionString
       - key: CORS_ORIGINS
-        sync: false
+        value: "*"
+
+databases:
+  - name: bondbook-db
+    plan: free

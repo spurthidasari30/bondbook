@@ -6,7 +6,7 @@ import { api, getToken, secureBlob, setToken } from './api'
 const categories = ['Happy', 'Funny', 'Special Day', 'Difficult Moment', 'Reflection', 'Milestone']
 const moods = ['Joyful', 'Warm', 'Grateful', 'Nostalgic', 'Calm', 'Hopeful', 'Heavy', 'Thoughtful']
 const nav = [
-  ['/', Home, 'Home'], ['/memories', BookHeart, 'Memories'], ['/reflections', MessageCircleHeart, 'Reflections'], ['/timeline', CalendarDays, 'Timeline'], ['/gallery', Image, 'Gallery'], ['/notifications', Bell, 'Updates'], ['/settings', Settings, 'Settings'],
+  ['/', Home, 'Home'], ['/memories', BookHeart, 'Memories'], ['/reflections', MessageCircleHeart, 'Reflections'], ['/timeline', CalendarDays, 'Timeline'], ['/notifications', Bell, 'Updates'], ['/settings', Settings, 'Settings'],
 ]
 
 function useFlash() {

@@ -1,6 +1,8 @@
 fastapi>=0.115,<1.0
 uvicorn[standard]>=0.30,<1.0
 SQLAlchemy>=2.0,<3.0
+# PostgreSQL driver used by the free Render Postgres database.
+psycopg[binary]>=3.1,<4.0
 passlib[bcrypt]>=1.7,<2.0
 # Passlib 1.7.x is not compatible with bcrypt 5's stricter long-password probe.
 bcrypt<5.0
