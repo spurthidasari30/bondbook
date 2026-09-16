@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 import secrets
 import shutil
 import uuid
@@ -155,7 +156,9 @@ class DuoGame(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     player_one_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False)
     player_two_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False)
+    game_type: Mapped[str] = mapped_column(String(32), default="tic_tac_toe", index=True, nullable=False)
     board: Mapped[str] = mapped_column(String(9), default="---------", nullable=False)
+    state: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
     turn_user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
     status: Mapped[str] = mapped_column(String(16), default="active", nullable=False)
     winner_id: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
@@ -187,6 +190,14 @@ def ensure_schema_compatibility():
         for column, definition in additions.items():
             if column not in user_columns:
                 connection.execute(text(f"ALTER TABLE users ADD COLUMN {column} {definition}"))
+        game_columns = {column["name"] for column in inspect(engine).get_columns("duo_games")}
+        game_additions = {
+            "game_type": "VARCHAR(32) NOT NULL DEFAULT 'tic_tac_toe'",
+            "state": "TEXT NOT NULL DEFAULT '{}'",
+        }
+        for column, definition in game_additions.items():
+            if column not in game_columns:
+                connection.execute(text(f"ALTER TABLE duo_games ADD COLUMN {column} {definition}"))
 
 ensure_schema_compatibility()
 
@@ -249,7 +260,8 @@ class LetterInput(BaseModel):
     confirmed_share: bool = False
 
 class GameMoveInput(BaseModel):
-    position: int = Field(ge=0, le=8)
+    position: Optional[int] = Field(default=None, ge=0, le=41)
+    choice: Optional[str] = Field(default=None, max_length=64)
 
 def db_session():
     db = SessionLocal()
@@ -611,46 +623,263 @@ def delete_letter(letter_id: int, user: User = Depends(current_user), db: Sessio
     if letter.sender_id != user.id: friendly_error("Only the author can delete this letter.", 403)
     db.delete(letter); db.commit()
 
-def pair_game(user: User, friend: User, db: Session) -> Optional[DuoGame]:
+GAME_CATALOG = {
+    "tic_tac_toe": ("Tic-Tac-Toe", "Claim three squares in a row."),
+    "connect_four": ("Connect Four", "Drop discs and make a line of four."),
+    "rock_paper_scissors": ("Rock Paper Scissors", "Choose in secret, then reveal together."),
+    "emoji_match": ("Emoji Match", "Take turns finding matching pairs."),
+    "number_hunt": ("Number Hunt", "Take turns guessing the hidden number."),
+    "word_duel": ("Word Duel", "Reveal the friendship word one letter at a time."),
+    "math_duel": ("Math Duel", "Six quick mental-math rounds."),
+    "higher_lower": ("Higher or Lower", "Predict the next card."),
+    "would_you_rather": ("Would You Rather", "Vote, then see whether you match."),
+    "friendship_trivia": ("Friendship Trivia", "Answer six playful BondBook questions."),
+}
+TRIVIA = [
+    ("Which colour is made by mixing red and blue?", ["Green", "Purple", "Orange", "Yellow"], 1),
+    ("Which one is a BondBook memory category?", ["Milestone", "Invoice", "Password", "Receipt"], 0),
+    ("What makes a memory visible to a connected friend?", ["Draft", "Shared", "Private", "Hidden"], 1),
+    ("Which is best for a friendship timeline?", ["A date", "A PIN", "A file size", "A password"], 0),
+    ("What is a kind response to a difficult reflection?", ["Ignore it", "Reply with care", "Share it", "Delete it"], 1),
+    ("What does a private entry mean?", ["Everyone sees it", "Only its owner sees it", "It is public", "It is deleted"], 1),
+]
+WYR = [
+    ("Would you rather…", "have a picnic in the rain", "watch a movie under the stars"),
+    ("Would you rather…", "get matching bracelets", "write matching playlists"),
+    ("Would you rather…", "revisit a favourite day", "make a completely new memory"),
+]
+WORD_BANK = ("FRIEND", "MEMORY", "SUNSHINE", "LAUGHTER", "TOGETHER", "KINDNESS")
+
+def random_card() -> int:
+    return 1 + secrets.randbelow(13)
+
+def new_math_round() -> dict:
+    first, second = 2 + secrets.randbelow(11), 2 + secrets.randbelow(11)
+    return {"question": f"{first} + {second}", "answer": first + second}
+
+def shuffled_emojis() -> list[str]:
+    deck = list("🌸🌸🎈🎈🍀🍀🌙🌙🧸🧸⭐️⭐️")
+    for index in range(len(deck) - 1, 0, -1):
+        swap = secrets.randbelow(index + 1)
+        deck[index], deck[swap] = deck[swap], deck[index]
+    return deck
+
+def fresh_game_state(game_type: str) -> dict:
+    if game_type == "tic_tac_toe": return {"board": "---------"}
+    if game_type == "connect_four": return {"board": "-" * 42}
+    if game_type == "rock_paper_scissors": return {"choices": {}}
+    if game_type == "emoji_match": return {"deck": shuffled_emojis(), "matched": [], "selected": [], "scores": {}}
+    if game_type == "number_hunt": return {"target": 1 + secrets.randbelow(20), "guesses": []}
+    if game_type == "word_duel": return {"word": secrets.choice(WORD_BANK), "guessed": [], "misses": 0}
+    if game_type == "math_duel": return {"round": 0, "scores": {}, **new_math_round()}
+    if game_type == "higher_lower": return {"round": 0, "current": random_card(), "next": random_card(), "scores": {}}
+    if game_type == "would_you_rather":
+        prompt, left, right = WYR[secrets.randbelow(len(WYR))]
+        return {"prompt": prompt, "options": [left, right], "votes": {}}
+    if game_type == "friendship_trivia": return {"round": 0, "scores": {}}
+    friendly_error("Unknown game.", 404)
+
+def game_state(game: DuoGame) -> dict:
+    try:
+        data = json.loads(game.state or "{}")
+        return data if isinstance(data, dict) else {}
+    except (TypeError, ValueError):
+        return {}
+
+def put_game_state(game: DuoGame, state: dict):
+    game.state = json.dumps(state, separators=(",", ":"), ensure_ascii=False)
+
+def pair_game(user: User, friend: User, db: Session, game_type: str) -> Optional[DuoGame]:
     pair = or_(and_(DuoGame.player_one_id == user.id, DuoGame.player_two_id == friend.id), and_(DuoGame.player_one_id == friend.id, DuoGame.player_two_id == user.id))
-    return db.scalar(select(DuoGame).where(pair).order_by(DuoGame.updated_at.desc()))
+    return db.scalar(select(DuoGame).where(pair, DuoGame.game_type == game_type).order_by(DuoGame.updated_at.desc()))
+
+def game_is_for_pair(game: DuoGame, user: User, friend: User, game_type: str) -> bool:
+    return game.game_type == game_type and {game.player_one_id, game.player_two_id} == {user.id, friend.id}
+
+def symbol_for(game: DuoGame, user: User) -> str:
+    return "X" if game.player_one_id == user.id else "O"
+
+def score_winner(game: DuoGame, state: dict):
+    first = state.get("scores", {}).get(str(game.player_one_id), 0)
+    second = state.get("scores", {}).get(str(game.player_two_id), 0)
+    game.status = "finished"; game.winner_id = game.player_one_id if first > second else game.player_two_id if second > first else None
 
 def game_data(game: DuoGame, user: User) -> dict:
-    symbol = "X" if game.player_one_id == user.id else "O"
-    return {"id": game.id, "board": game.board, "status": game.status, "turn_user_id": game.turn_user_id, "winner_id": game.winner_id, "is_my_turn": game.status == "active" and game.turn_user_id == user.id, "symbol": symbol, "is_winner": game.winner_id == user.id}
+    state, opponent_id = game_state(game), game.player_two_id if game.player_one_id == user.id else game.player_one_id
+    data = {"id": game.id, "game_type": game.game_type, "title": GAME_CATALOG[game.game_type][0], "status": game.status, "turn_user_id": game.turn_user_id, "winner_id": game.winner_id, "is_my_turn": game.status == "active" and game.turn_user_id == user.id, "is_winner": game.winner_id == user.id, "symbol": symbol_for(game, user)}
+    if game.game_type == "tic_tac_toe": data["board"] = state.get("board", game.board)
+    elif game.game_type == "connect_four": data["board"] = state.get("board", "-" * 42)
+    elif game.game_type == "rock_paper_scissors":
+        choices = state.get("choices", {}); data.update({"my_choice": choices.get(str(user.id)), "opponent_ready": str(opponent_id) in choices})
+        if game.status == "finished": data["choices"] = choices
+    elif game.game_type == "emoji_match":
+        matched, selected, deck = state.get("matched", []), state.get("selected", []), state.get("deck", [])
+        data.update({"display": [deck[index] if index in matched or index in selected else "?" for index in range(len(deck))], "matched": matched, "scores": state.get("scores", {})})
+    elif game.game_type == "number_hunt":
+        data.update({"guesses": state.get("guesses", []), "remaining": max(0, 6 - len(state.get("guesses", [])))})
+        if game.status == "finished": data["target"] = state.get("target")
+    elif game.game_type == "word_duel":
+        word, guessed = state.get("word", ""), state.get("guessed", [])
+        data.update({"word": " ".join(letter if letter in guessed else "_" for letter in word), "guessed": guessed, "misses": state.get("misses", 0)})
+        if game.status == "finished": data["answer"] = word
+    elif game.game_type == "math_duel": data.update({"question": state.get("question"), "round": state.get("round", 0), "scores": state.get("scores", {})})
+    elif game.game_type == "higher_lower": data.update({"current": state.get("current"), "round": state.get("round", 0), "scores": state.get("scores", {})})
+    elif game.game_type == "would_you_rather":
+        votes = state.get("votes", {}); data.update({"prompt": state.get("prompt"), "options": state.get("options", []), "my_vote": votes.get(str(user.id)), "opponent_ready": str(opponent_id) in votes})
+        if game.status == "finished": data["votes"] = votes
+    elif game.game_type == "friendship_trivia":
+        round_index = state.get("round", 0); question = TRIVIA[min(round_index, len(TRIVIA) - 1)]
+        data.update({"question": question[0], "options": question[1], "round": round_index, "scores": state.get("scores", {})})
+    return data
 
-@app.get("/api/games/tic-tac-toe")
-def get_game(user: User = Depends(current_user), db: Session = Depends(db_session)):
+def valid_position(payload: GameMoveInput, maximum: int) -> int:
+    if payload.position is None or payload.position < 0 or payload.position > maximum: friendly_error("Choose a valid game square.")
+    return payload.position
+
+def valid_choice(payload: GameMoveInput) -> str:
+    value = (payload.choice or "").strip()
+    if not value: friendly_error("Choose an answer before continuing.")
+    return value
+
+def won_three(board: list[str]) -> bool:
+    return any(board[a] == board[b] == board[c] != "-" for a,b,c in ((0,1,2),(3,4,5),(6,7,8),(0,3,6),(1,4,7),(2,5,8),(0,4,8),(2,4,6)))
+
+def won_four(board: list[str], row: int, column: int) -> bool:
+    mark = board[row * 7 + column]
+    for row_delta, col_delta in ((0,1),(1,0),(1,1),(1,-1)):
+        total = 1
+        for direction in (-1,1):
+            r, c = row + row_delta * direction, column + col_delta * direction
+            while 0 <= r < 6 and 0 <= c < 7 and board[r * 7 + c] == mark:
+                total += 1; r += row_delta * direction; c += col_delta * direction
+        if total >= 4: return True
+    return False
+
+@app.get("/api/games")
+def list_games(user: User = Depends(current_user), db: Session = Depends(db_session)):
     friend = connected_friend(user, db)
-    game = pair_game(user, friend, db)
+    return [{"type": kind, "title": title, "description": description, "game": game_data(game, user) if (game := pair_game(user, friend, db, kind)) else None} for kind, (title, description) in GAME_CATALOG.items()]
+
+@app.get("/api/games/{game_type}")
+def get_game(game_type: str, user: User = Depends(current_user), db: Session = Depends(db_session)):
+    if game_type not in GAME_CATALOG: friendly_error("Unknown game.", 404)
+    friend = connected_friend(user, db); game = pair_game(user, friend, db, game_type)
     return {"game": game_data(game, user) if game else None}
 
-@app.post("/api/games/tic-tac-toe", status_code=201)
-def start_game(user: User = Depends(current_user), db: Session = Depends(db_session)):
-    friend = connected_friend(user, db)
-    game = pair_game(user, friend, db)
+@app.post("/api/games/{game_type}", status_code=201)
+def start_game(game_type: str, user: User = Depends(current_user), db: Session = Depends(db_session)):
+    if game_type not in GAME_CATALOG: friendly_error("Unknown game.", 404)
+    friend = connected_friend(user, db); game = pair_game(user, friend, db, game_type); state = fresh_game_state(game_type)
     if not game:
-        game = DuoGame(player_one_id=user.id, player_two_id=friend.id, turn_user_id=user.id)
+        game = DuoGame(player_one_id=user.id, player_two_id=friend.id, game_type=game_type, turn_user_id=user.id, board="---------")
         db.add(game)
     else:
         game.board = "---------"; game.turn_user_id = user.id; game.status = "active"; game.winner_id = None
-    notify(db, friend.id, "game", f"{user.name} started a Tic-Tac-Toe game with you.")
+    put_game_state(game, state)
+    notify(db, friend.id, "game", f"{user.name} started {GAME_CATALOG[game_type][0]} with you.")
     db.commit(); db.refresh(game)
     return {"game": game_data(game, user)}
 
-@app.post("/api/games/tic-tac-toe/{game_id}/move")
-def make_game_move(game_id: int, payload: GameMoveInput, user: User = Depends(current_user), db: Session = Depends(db_session)):
+@app.post("/api/games/{game_type}/{game_id}/move")
+def make_game_move(game_type: str, game_id: int, payload: GameMoveInput, user: User = Depends(current_user), db: Session = Depends(db_session)):
+    if game_type not in GAME_CATALOG: friendly_error("Unknown game.", 404)
     friend = connected_friend(user, db); game = db.get(DuoGame, game_id)
-    if not game or pair_game(user, friend, db) != game: friendly_error("This game is unavailable.", 404)
-    if game.status != "active" or game.turn_user_id != user.id: friendly_error("It is not your turn.", 409)
-    board = list(game.board)
-    if board[payload.position] != "-": friendly_error("Choose an empty square.", 409)
-    board[payload.position] = "X" if game.player_one_id == user.id else "O"; game.board = "".join(board)
-    winning_lines = ((0,1,2),(3,4,5),(6,7,8),(0,3,6),(1,4,7),(2,5,8),(0,4,8),(2,4,6))
-    won = any(board[a] == board[b] == board[c] != "-" for a,b,c in winning_lines)
-    if won: game.status = "finished"; game.winner_id = user.id; notify(db, friend.id, "game", f"{user.name} won your Tic-Tac-Toe game.")
-    elif "-" not in board: game.status = "finished"; game.winner_id = None; notify(db, friend.id, "game", "Your Tic-Tac-Toe game ended in a draw.")
-    else: game.turn_user_id = friend.id; notify(db, friend.id, "game", f"{user.name} made a move. Your turn in Tic-Tac-Toe.")
+    if not game or not game_is_for_pair(game, user, friend, game_type): friendly_error("This game is unavailable.", 404)
+    if game.status != "active": friendly_error("This game has already finished.", 409)
+    state, other_id = game_state(game), friend.id
+    free_choice_game = game_type in {"rock_paper_scissors", "would_you_rather"}
+    if not free_choice_game and game.turn_user_id != user.id: friendly_error("It is not your turn.", 409)
+    if game_type == "tic_tac_toe":
+        position = valid_position(payload, 8); board = list(state.get("board", game.board))
+        if len(board) != 9 or board[position] != "-": friendly_error("Choose an empty square.", 409)
+        board[position] = symbol_for(game, user); state["board"] = "".join(board); game.board = state["board"]
+        if won_three(board): game.status = "finished"; game.winner_id = user.id
+        elif "-" not in board: game.status = "finished"; game.winner_id = None
+        else: game.turn_user_id = other_id
+    elif game_type == "connect_four":
+        column = valid_position(payload, 6); board = list(state.get("board", "-" * 42)); row = next((r for r in range(5, -1, -1) if board[r * 7 + column] == "-"), None)
+        if row is None: friendly_error("That column is full.", 409)
+        board[row * 7 + column] = symbol_for(game, user); state["board"] = "".join(board)
+        if won_four(board, row, column): game.status = "finished"; game.winner_id = user.id
+        elif "-" not in board: game.status = "finished"; game.winner_id = None
+        else: game.turn_user_id = other_id
+    elif game_type == "rock_paper_scissors":
+        choice = valid_choice(payload).lower()
+        if choice not in {"rock", "paper", "scissors"}: friendly_error("Choose rock, paper, or scissors.")
+        choices = state.setdefault("choices", {})
+        if str(user.id) in choices: friendly_error("You already made your secret choice.", 409)
+        choices[str(user.id)] = choice
+        if str(other_id) in choices:
+            first, second = choices[str(game.player_one_id)], choices[str(game.player_two_id)]
+            game.status = "finished"
+            if first != second: game.winner_id = game.player_one_id if {first, second} in ({"rock", "scissors"},{"scissors", "paper"},{"paper", "rock"}) else game.player_two_id
+    elif game_type == "emoji_match":
+        position = valid_position(payload, 11); selected, matched, deck = state.setdefault("selected", []), state.setdefault("matched", []), state.get("deck", [])
+        if position in selected or position in matched: friendly_error("Choose a hidden tile.", 409)
+        selected.append(position)
+        if len(selected) == 2:
+            if deck[selected[0]] == deck[selected[1]]:
+                matched.extend(selected); scores = state.setdefault("scores", {}); scores[str(user.id)] = scores.get(str(user.id), 0) + 1
+                if len(matched) == len(deck): score_winner(game, state)
+            else: game.turn_user_id = other_id
+            state["selected"] = []
+    elif game_type == "number_hunt":
+        guess = valid_position(payload, 20)
+        if guess < 1: friendly_error("Choose a number from 1 to 20.")
+        guesses = state.setdefault("guesses", []); guesses.append({"value": guess, "by": user.id, "difference": abs(guess - state["target"])})
+        if guess == state["target"]: game.status = "finished"; game.winner_id = user.id
+        elif len(guesses) >= 6:
+            nearest = min(item["difference"] for item in guesses); owners = {item["by"] for item in guesses if item["difference"] == nearest}; game.status = "finished"; game.winner_id = owners.pop() if len(owners) == 1 else None
+        else: game.turn_user_id = other_id
+    elif game_type == "word_duel":
+        letter = valid_choice(payload).upper()
+        if len(letter) != 1 or not letter.isalpha(): friendly_error("Enter one letter.")
+        guessed = state.setdefault("guessed", [])
+        if letter in guessed: friendly_error("That letter was already guessed.", 409)
+        guessed.append(letter)
+        if letter not in state["word"]: state["misses"] = state.get("misses", 0) + 1
+        if all(char in guessed for char in state["word"]): game.status = "finished"; game.winner_id = user.id
+        elif state.get("misses", 0) >= 6: game.status = "finished"; game.winner_id = other_id
+        else: game.turn_user_id = other_id
+    elif game_type == "math_duel":
+        try: answer = int(valid_choice(payload))
+        except ValueError: friendly_error("Enter a whole-number answer.")
+        scores = state.setdefault("scores", {})
+        if answer == state["answer"]: scores[str(user.id)] = scores.get(str(user.id), 0) + 1
+        state["round"] = state.get("round", 0) + 1
+        if state["round"] >= 6: score_winner(game, state)
+        else: state.update(new_math_round()); game.turn_user_id = other_id
+    elif game_type == "higher_lower":
+        choice = valid_choice(payload).lower()
+        if choice not in {"higher", "lower"}: friendly_error("Choose higher or lower.")
+        correct = state["next"] > state["current"] if choice == "higher" else state["next"] < state["current"]
+        scores = state.setdefault("scores", {})
+        if correct: scores[str(user.id)] = scores.get(str(user.id), 0) + 1
+        state["current"] = state["next"]; state["next"] = random_card(); state["round"] = state.get("round", 0) + 1
+        if state["round"] >= 6: score_winner(game, state)
+        else: game.turn_user_id = other_id
+    elif game_type == "would_you_rather":
+        choice = valid_choice(payload)
+        if choice not in {"A", "B"}: friendly_error("Choose one of the two options.")
+        votes = state.setdefault("votes", {})
+        if str(user.id) in votes: friendly_error("You already voted.", 409)
+        votes[str(user.id)] = choice
+        if str(other_id) in votes: game.status = "finished"; game.winner_id = None
+    elif game_type == "friendship_trivia":
+        choice = valid_choice(payload)
+        try: answer = int(choice)
+        except ValueError: friendly_error("Choose one answer.")
+        round_index = state.get("round", 0); question = TRIVIA[round_index]
+        if answer < 0 or answer >= len(question[1]): friendly_error("Choose one answer.")
+        scores = state.setdefault("scores", {})
+        if answer == question[2]: scores[str(user.id)] = scores.get(str(user.id), 0) + 1
+        state["round"] = round_index + 1
+        if state["round"] >= len(TRIVIA): score_winner(game, state)
+        else: game.turn_user_id = other_id
+    put_game_state(game, state)
+    message = f"{user.name} made a move in {GAME_CATALOG[game_type][0]}."
+    if game.status == "finished": message = f"{GAME_CATALOG[game_type][0]} finished — check the result!"
+    notify(db, friend.id, "game", message)
     db.commit(); db.refresh(game)
     return {"game": game_data(game, user)}
 
