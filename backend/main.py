@@ -24,7 +24,7 @@ load_dotenv(BASE_DIR / ".env")
 load_dotenv(BASE_DIR.parent / ".env", override=False)
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./bondbook.db")
-if DATABASE_URL.startswith("sqlite:///") and not DATABASE_URL.startswith("sqlite:////"):
+if DATABASE_URL.startswith("sqlite:///") and not DATABASE_URL.startswith("sqlite:////") and DATABASE_URL != "sqlite:///:memory:":
     database_file = DATABASE_URL.replace("sqlite:///", "", 1)
     DATABASE_URL = f"sqlite:///{(BASE_DIR / database_file).resolve()}"
 # Render supplies a standard Postgres URL. SQLAlchemy needs the explicit
@@ -125,6 +125,14 @@ class Notification(Base):
     is_read: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), index=True)
 
+class ChatMessage(Base):
+    __tablename__ = "chat_messages"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    sender_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False)
+    recipient_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False)
+    message: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), index=True)
+
 Base.metadata.create_all(bind=engine)
 
 def ensure_schema_compatibility():
@@ -185,6 +193,9 @@ class ConnectionInput(BaseModel):
     invite_code: str = Field(min_length=6, max_length=16)
 
 class ResponseInput(BaseModel):
+    message: str = Field(min_length=1, max_length=3000)
+
+class ChatMessageInput(BaseModel):
     message: str = Field(min_length=1, max_length=3000)
 
 def db_session():
@@ -251,6 +262,15 @@ def memory_data(memory: Memory, db: Session, include_responses: bool = True) -> 
 
 def notify(db: Session, user_id: int, type_: str, message: str, memory_id: Optional[int] = None):
     db.add(Notification(user_id=user_id, type=type_, message=message, memory_id=memory_id))
+
+def connected_friend(user: User, db: Session) -> User:
+    friend = db.get(User, user.friend_id) if user.friend_id else None
+    if not friend or friend.friend_id != user.id:
+        friendly_error("Connect with your friend before opening the chat.", 403)
+    return friend
+
+def chat_data(message: ChatMessage, user: User) -> dict:
+    return {"id": message.id, "message": message.message, "sender_id": message.sender_id, "is_mine": message.sender_id == user.id, "created_at": message.created_at}
 
 app = FastAPI(title="BondBook API", version="1.0.0")
 origins = [o.strip() for o in os.getenv("CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").split(",")]
@@ -483,6 +503,28 @@ def add_response(memory_id: int, payload: ResponseInput, user: User = Depends(cu
     db.add(response); notify(db, reflection.owner_id, "reflection_response", f"{user.name} responded to your reflection “{reflection.title}”.", reflection.id)
     db.commit(); db.refresh(response)
     return {"id": response.id, "message": response.message, "author_id": user.id, "author_name": user.name, "author_color": user.avatar_color, "created_at": response.created_at}
+
+@app.get("/api/chat/messages")
+def get_chat_messages(user: User = Depends(current_user), db: Session = Depends(db_session)):
+    friend = connected_friend(user, db)
+    conversation = or_(
+        and_(ChatMessage.sender_id == user.id, ChatMessage.recipient_id == friend.id),
+        and_(ChatMessage.sender_id == friend.id, ChatMessage.recipient_id == user.id),
+    )
+    messages = db.scalars(select(ChatMessage).where(conversation).order_by(ChatMessage.created_at.asc()).limit(200)).all()
+    return {"friend": {"id": friend.id, "name": friend.name, "avatar_color": friend.avatar_color}, "messages": [chat_data(message, user) for message in messages]}
+
+@app.post("/api/chat/messages", status_code=201)
+def send_chat_message(payload: ChatMessageInput, user: User = Depends(current_user), db: Session = Depends(db_session)):
+    friend = connected_friend(user, db)
+    message_text = payload.message.strip()
+    if not message_text:
+        friendly_error("Write a message before sending it.")
+    message = ChatMessage(sender_id=user.id, recipient_id=friend.id, message=message_text)
+    db.add(message)
+    notify(db, friend.id, "chat_message", f"{user.name} sent you a message.")
+    db.commit(); db.refresh(message)
+    return chat_data(message, user)
 
 @app.get("/api/timeline")
 def timeline(user: User = Depends(current_user), db: Session = Depends(db_session)):
