@@ -3,7 +3,8 @@ services:
     name: bondbook-web
     runtime: static
     buildCommand: npm ci && npm run build
-    staticPublishPath: ./frontend/dist
+    # rootDir is frontend, so the Vite build output is dist within that directory.
+    staticPublishPath: ./dist
     rootDir: frontend
     envVars:
       - key: VITE_API_URL
