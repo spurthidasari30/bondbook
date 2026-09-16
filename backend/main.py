@@ -67,6 +67,11 @@ class User(Base):
     invite_code: Mapped[str] = mapped_column(String(16), unique=True, index=True, nullable=False)
     friend_id: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True, unique=True)
     theme: Mapped[str] = mapped_column(String(10), default="light")
+    background: Mapped[str] = mapped_column(String(24), default="cream")
+    font: Mapped[str] = mapped_column(String(24), default="classic")
+    sticker: Mapped[str] = mapped_column(String(24), default="heart")
+    cover_style: Mapped[str] = mapped_column(String(24), default="lavender")
+    friendship_nickname: Mapped[str] = mapped_column(String(80), default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
     friend: Mapped[Optional["User"]] = relationship("User", remote_side=[id], uselist=False)
     memories: Mapped[list["Memory"]] = relationship(back_populates="owner", cascade="all, delete-orphan", foreign_keys="Memory.owner_id")
@@ -133,6 +138,30 @@ class ChatMessage(Base):
     message: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), index=True)
 
+class OpenWhenLetter(Base):
+    __tablename__ = "open_when_letters"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    sender_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False)
+    recipient_id: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), index=True, nullable=True)
+    title: Mapped[str] = mapped_column(String(140), nullable=False)
+    occasion: Mapped[str] = mapped_column(String(100), nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    visibility: Mapped[str] = mapped_column(String(12), default="Private", index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+
+class DuoGame(Base):
+    __tablename__ = "duo_games"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    player_one_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False)
+    player_two_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False)
+    board: Mapped[str] = mapped_column(String(9), default="---------", nullable=False)
+    turn_user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), default="active", nullable=False)
+    winner_id: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc), index=True)
+
 Base.metadata.create_all(bind=engine)
 
 def ensure_schema_compatibility():
@@ -142,13 +171,22 @@ def ensure_schema_compatibility():
     deliberately left without a recipient, so the owner must explicitly re-share
     them rather than exposing them to a later connection by accident.
     """
-    if engine.dialect.name != "sqlite":
-        return
-    columns = {column["name"] for column in inspect(engine).get_columns("memories")}
-    if "shared_with_id" not in columns:
-        with engine.begin() as connection:
+    with engine.begin() as connection:
+        memory_columns = {column["name"] for column in inspect(engine).get_columns("memories")}
+        if "shared_with_id" not in memory_columns:
             connection.execute(text("ALTER TABLE memories ADD COLUMN shared_with_id INTEGER"))
             connection.execute(text("CREATE INDEX IF NOT EXISTS ix_memories_shared_with_id ON memories (shared_with_id)"))
+        user_columns = {column["name"] for column in inspect(engine).get_columns("users")}
+        additions = {
+            "background": "VARCHAR(24) NOT NULL DEFAULT 'cream'",
+            "font": "VARCHAR(24) NOT NULL DEFAULT 'classic'",
+            "sticker": "VARCHAR(24) NOT NULL DEFAULT 'heart'",
+            "cover_style": "VARCHAR(24) NOT NULL DEFAULT 'lavender'",
+            "friendship_nickname": "VARCHAR(80) NOT NULL DEFAULT ''",
+        }
+        for column, definition in additions.items():
+            if column not in user_columns:
+                connection.execute(text(f"ALTER TABLE users ADD COLUMN {column} {definition}"))
 
 ensure_schema_compatibility()
 
@@ -167,7 +205,12 @@ class LoginInput(BaseModel):
 class UserUpdate(BaseModel):
     name: Optional[str] = Field(default=None, min_length=2, max_length=80)
     avatar_color: Optional[str] = Field(default=None, pattern=r"^#[0-9a-fA-F]{6}$")
-    theme: Optional[Literal["light", "dark"]] = None
+    theme: Optional[Literal["light", "dark", "lavender", "rose", "midnight"]] = None
+    background: Optional[Literal["cream", "lavender", "blush", "sky", "midnight"]] = None
+    font: Optional[Literal["classic", "modern", "rounded"]] = None
+    sticker: Optional[Literal["heart", "sparkles", "flower", "moon"]] = None
+    cover_style: Optional[Literal["lavender", "blush", "sunset", "night"]] = None
+    friendship_nickname: Optional[str] = Field(default=None, max_length=80)
 
 class PasswordUpdate(BaseModel):
     current_password: str
@@ -197,6 +240,16 @@ class ResponseInput(BaseModel):
 
 class ChatMessageInput(BaseModel):
     message: str = Field(min_length=1, max_length=3000)
+
+class LetterInput(BaseModel):
+    title: str = Field(min_length=1, max_length=140)
+    occasion: str = Field(min_length=1, max_length=100)
+    content: str = Field(min_length=1, max_length=10000)
+    visibility: Literal["Private", "Draft", "Shared"] = "Private"
+    confirmed_share: bool = False
+
+class GameMoveInput(BaseModel):
+    position: int = Field(ge=0, le=8)
 
 def db_session():
     db = SessionLocal()
@@ -232,7 +285,7 @@ def current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(db_s
 
 def user_data(user: User, db: Session) -> dict:
     friend = db.get(User, user.friend_id) if user.friend_id else None
-    return {"id": user.id, "name": user.name, "email": user.email, "avatar_color": user.avatar_color, "invite_code": user.invite_code, "theme": user.theme, "friend": {"id": friend.id, "name": friend.name, "email": friend.email, "avatar_color": friend.avatar_color} if friend else None, "created_at": user.created_at}
+    return {"id": user.id, "name": user.name, "email": user.email, "avatar_color": user.avatar_color, "invite_code": user.invite_code, "theme": user.theme, "background": user.background, "font": user.font, "sticker": user.sticker, "cover_style": user.cover_style, "friendship_nickname": user.friendship_nickname, "friend": {"id": friend.id, "name": friend.name, "email": friend.email, "avatar_color": friend.avatar_color} if friend else None, "created_at": user.created_at}
 
 def visible_memories_for(user: User):
     if not user.friend_id:
@@ -307,7 +360,7 @@ def me(user: User = Depends(current_user), db: Session = Depends(db_session)):
 @app.patch("/api/users/me")
 def update_profile(payload: UserUpdate, user: User = Depends(current_user), db: Session = Depends(db_session)):
     for field, value in payload.model_dump(exclude_none=True).items():
-        setattr(user, field, value.strip() if isinstance(value, str) and field == "name" else value)
+        setattr(user, field, value.strip() if isinstance(value, str) and field in {"name", "friendship_nickname"} else value)
     db.commit(); db.refresh(user)
     return user_data(user, db)
 
@@ -525,6 +578,81 @@ def send_chat_message(payload: ChatMessageInput, user: User = Depends(current_us
     notify(db, friend.id, "chat_message", f"{user.name} sent you a message.")
     db.commit(); db.refresh(message)
     return chat_data(message, user)
+
+def letter_data(letter: OpenWhenLetter, user: User, db: Session) -> dict:
+    sender = db.get(User, letter.sender_id)
+    return {"id": letter.id, "title": letter.title, "occasion": letter.occasion, "content": letter.content, "visibility": letter.visibility, "is_mine": letter.sender_id == user.id, "sender_name": sender.name if sender else "Your friend", "created_at": letter.created_at}
+
+@app.get("/api/letters")
+def list_letters(user: User = Depends(current_user), db: Session = Depends(db_session)):
+    sent = db.scalars(select(OpenWhenLetter).where(OpenWhenLetter.sender_id == user.id).order_by(OpenWhenLetter.created_at.desc())).all()
+    received = []
+    if user.friend_id:
+        received = db.scalars(select(OpenWhenLetter).where(OpenWhenLetter.sender_id == user.friend_id, OpenWhenLetter.recipient_id == user.id, OpenWhenLetter.visibility == "Shared").order_by(OpenWhenLetter.created_at.desc())).all()
+    return {"sent": [letter_data(letter, user, db) for letter in sent], "received": [letter_data(letter, user, db) for letter in received]}
+
+@app.post("/api/letters", status_code=201)
+def create_letter(payload: LetterInput, user: User = Depends(current_user), db: Session = Depends(db_session)):
+    recipient_id = None
+    if payload.visibility == "Shared":
+        friend = connected_friend(user, db)
+        if not payload.confirmed_share: friendly_error("Please confirm before sharing this letter.")
+        recipient_id = friend.id
+    letter = OpenWhenLetter(sender_id=user.id, recipient_id=recipient_id, title=payload.title.strip(), occasion=payload.occasion.strip(), content=payload.content.strip(), visibility=payload.visibility)
+    db.add(letter)
+    if recipient_id: notify(db, recipient_id, "open_when_letter", f"{user.name} left you an Open When letter.")
+    db.commit(); db.refresh(letter)
+    return letter_data(letter, user, db)
+
+@app.delete("/api/letters/{letter_id}", status_code=204)
+def delete_letter(letter_id: int, user: User = Depends(current_user), db: Session = Depends(db_session)):
+    letter = db.get(OpenWhenLetter, letter_id)
+    if not letter: friendly_error("Letter not found.", 404)
+    if letter.sender_id != user.id: friendly_error("Only the author can delete this letter.", 403)
+    db.delete(letter); db.commit()
+
+def pair_game(user: User, friend: User, db: Session) -> Optional[DuoGame]:
+    pair = or_(and_(DuoGame.player_one_id == user.id, DuoGame.player_two_id == friend.id), and_(DuoGame.player_one_id == friend.id, DuoGame.player_two_id == user.id))
+    return db.scalar(select(DuoGame).where(pair).order_by(DuoGame.updated_at.desc()))
+
+def game_data(game: DuoGame, user: User) -> dict:
+    symbol = "X" if game.player_one_id == user.id else "O"
+    return {"id": game.id, "board": game.board, "status": game.status, "turn_user_id": game.turn_user_id, "winner_id": game.winner_id, "is_my_turn": game.status == "active" and game.turn_user_id == user.id, "symbol": symbol, "is_winner": game.winner_id == user.id}
+
+@app.get("/api/games/tic-tac-toe")
+def get_game(user: User = Depends(current_user), db: Session = Depends(db_session)):
+    friend = connected_friend(user, db)
+    game = pair_game(user, friend, db)
+    return {"game": game_data(game, user) if game else None}
+
+@app.post("/api/games/tic-tac-toe", status_code=201)
+def start_game(user: User = Depends(current_user), db: Session = Depends(db_session)):
+    friend = connected_friend(user, db)
+    game = pair_game(user, friend, db)
+    if not game:
+        game = DuoGame(player_one_id=user.id, player_two_id=friend.id, turn_user_id=user.id)
+        db.add(game)
+    else:
+        game.board = "---------"; game.turn_user_id = user.id; game.status = "active"; game.winner_id = None
+    notify(db, friend.id, "game", f"{user.name} started a Tic-Tac-Toe game with you.")
+    db.commit(); db.refresh(game)
+    return {"game": game_data(game, user)}
+
+@app.post("/api/games/tic-tac-toe/{game_id}/move")
+def make_game_move(game_id: int, payload: GameMoveInput, user: User = Depends(current_user), db: Session = Depends(db_session)):
+    friend = connected_friend(user, db); game = db.get(DuoGame, game_id)
+    if not game or pair_game(user, friend, db) != game: friendly_error("This game is unavailable.", 404)
+    if game.status != "active" or game.turn_user_id != user.id: friendly_error("It is not your turn.", 409)
+    board = list(game.board)
+    if board[payload.position] != "-": friendly_error("Choose an empty square.", 409)
+    board[payload.position] = "X" if game.player_one_id == user.id else "O"; game.board = "".join(board)
+    winning_lines = ((0,1,2),(3,4,5),(6,7,8),(0,3,6),(1,4,7),(2,5,8),(0,4,8),(2,4,6))
+    won = any(board[a] == board[b] == board[c] != "-" for a,b,c in winning_lines)
+    if won: game.status = "finished"; game.winner_id = user.id; notify(db, friend.id, "game", f"{user.name} won your Tic-Tac-Toe game.")
+    elif "-" not in board: game.status = "finished"; game.winner_id = None; notify(db, friend.id, "game", "Your Tic-Tac-Toe game ended in a draw.")
+    else: game.turn_user_id = friend.id; notify(db, friend.id, "game", f"{user.name} made a move. Your turn in Tic-Tac-Toe.")
+    db.commit(); db.refresh(game)
+    return {"game": game_data(game, user)}
 
 @app.get("/api/timeline")
 def timeline(user: User = Depends(current_user), db: Session = Depends(db_session)):
