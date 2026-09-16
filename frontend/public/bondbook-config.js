@@ -1,3 +1,2 @@
-// For local development, Vite proxies /api to FastAPI.
-// For Netlify, replace the empty value with your HTTPS FastAPI URL.
-window.BONDBOOK_API_URL = "";
+// The deployed frontend sends every API request to the Render FastAPI service.
+window.BONDBOOK_API_URL = "https://bondbook-api.onrender.com";

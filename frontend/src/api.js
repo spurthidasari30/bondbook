@@ -1,7 +1,7 @@
-// A deployed static site reads bondbook-config.js at runtime. This lets the
-// Netlify upload keep working without rebuilding after the API URL is known.
+// A deployed static site reads bondbook-config.js at runtime. The fallback
+// keeps the Render API connected even if that file is cached temporarily.
 const runtimeApiUrl = typeof window !== 'undefined' ? window.BONDBOOK_API_URL : ''
-const API_BASE = (runtimeApiUrl || import.meta.env.VITE_API_URL || '').replace(/\/+$/, '')
+const API_BASE = (runtimeApiUrl || import.meta.env.VITE_API_URL || 'https://bondbook-api.onrender.com').replace(/\/+$/, '')
 
 export function getToken() { return localStorage.getItem('bondbook_token') }
 export function setToken(token) { token ? localStorage.setItem('bondbook_token', token) : localStorage.removeItem('bondbook_token') }

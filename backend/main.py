@@ -256,6 +256,10 @@ app = FastAPI(title="BondBook API", version="1.0.0")
 origins = [o.strip() for o in os.getenv("CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").split(",")]
 app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 
+@app.get("/")
+def root():
+    return {"status": "ok", "service": "BondBook API", "health": "/api/health", "docs": "/docs"}
+
 @app.get("/api/health")
 def health():
     return {"status": "ok", "service": "BondBook API"}

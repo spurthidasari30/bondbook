@@ -6,12 +6,6 @@ services:
     # rootDir is frontend, so the Vite build output is dist within that directory.
     staticPublishPath: ./dist
     rootDir: frontend
-    envVars:
-      - key: VITE_API_URL
-        fromService:
-          name: bondbook-api
-          type: web
-          envVarKey: RENDER_EXTERNAL_URL
     routes:
       - type: rewrite
         source: /*
